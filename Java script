@@ -1,0 +1,284 @@
+/* ---------- Helpers ---------- */
+const $ = id => document.getElementById(id);
+
+function load(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function esc(str) {
+  return String(str).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function badge(status) {
+  return status
+    ? `<span class="badge ${status}">${status}</span>`
+    : `<span class="badge none">Not Marked</span>`;
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+function todayStr() {
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+/* ---------- Data ---------- */
+const STATUSES = ["Present", "Absent", "Late", "Leave"];
+let students = load("sat_students", []);
+let records = load("sat_records", []);   // { sid, date, status }
+let threshold = Number(load("sat_threshold", 75));
+let editingId = null;
+const unlocked = new Set();              // students unlocked via "Change"
+
+function saveAll() {
+  localStorage.setItem("sat_students", JSON.stringify(students));
+  localStorage.setItem("sat_records", JSON.stringify(records));
+  localStorage.setItem("sat_threshold", JSON.stringify(threshold));
+}
+
+function statusOn(sid, date) {
+  const r = records.find(x => x.sid === sid && x.date === date);
+  return r ? r.status : null;
+}
+
+function stats(sid) {
+  const r = records.filter(x => x.sid === sid);
+  const attended = r.filter(x => x.status === "Present" || x.status === "Late").length;
+  return { total: r.length, attended, pct: r.length ? (attended / r.length) * 100 : null };
+}
+
+function isLow(sid) {
+  const p = stats(sid).pct;
+  return p !== null && p < threshold;
+}
+
+function filteredStudents() {
+  const q = $("search").value.trim().toLowerCase();
+  const dept = $("deptFilter").value, st = $("statusFilter").value, date = $("date").value;
+  return students.filter(s => {
+    if (q && !(s.name + " " + s.id + " " + s.dept).toLowerCase().includes(q)) return false;
+    if (dept && s.dept !== dept) return false;
+    if (st === "Low") return isLow(s.id);
+    if (st === "Not Marked") return !statusOn(s.id, date);
+    if (st) return statusOn(s.id, date) === st;
+    return true;
+  });
+}
+
+/* ---------- Rendering ---------- */
+function renderSummary() {
+  const date = $("date").value;
+  const present = students.filter(s => ["Present", "Late"].includes(statusOn(s.id, date))).length;
+  const absent = students.filter(s => statusOn(s.id, date) === "Absent").length;
+  const total = records.length;
+  const attended = records.filter(r => r.status === "Present" || r.status === "Late").length;
+  const overall = total ? (attended / total * 100).toFixed(1) : "0.0";
+  const low = students.filter(s => isLow(s.id)).length;
+  $("summary").innerHTML = `
+    <div class="card"><span>Total Students</span><strong>${students.length}</strong></div>
+    <div class="card green"><span>Present on Selected Date</span><strong>${present}</strong></div>
+    <div class="card red"><span>Absent on Selected Date</span><strong>${absent}</strong></div>
+    <div class="card"><span>Overall Attendance</span><strong>${overall}%</strong></div>
+    <div class="card orange"><span>Below ${threshold}%</span><strong>${low}</strong></div>`;
+}
+
+function renderDeptOptions() {
+  const depts = [...new Set(students.map(s => s.dept))].sort();
+  const sel = $("deptFilter");
+  const current = sel.value;
+  sel.innerHTML = `<option value="">All</option>` +
+    depts.map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join("");
+  sel.value = depts.includes(current) ? current : "";
+  $("deptList").innerHTML = depts.map(d => `<option value="${esc(d)}"></option>`).join("");
+}
+
+function renderStudents() {
+  const date = $("date").value;
+  const list = filteredStudents();
+  if (!list.length) {
+    $("studentRows").innerHTML = `<tr><td colspan="7" class="empty">No students found.</td></tr>`;
+    return;
+  }
+  $("studentRows").innerHTML = list.map(s => {
+    const st = stats(s.id);
+    const low = isLow(s.id);
+    const pct = st.pct === null
+      ? "-"
+      : `<span class="${low ? "pct-low" : "pct-ok"}">${st.pct.toFixed(1)}%${low ? " ⚠" : ""}</span>`;
+    return `<tr class="${low ? "low" : ""}">
+      <td>${esc(s.id)}</td>
+      <td>${esc(s.name)}</td>
+      <td>${esc(s.dept)}</td>
+      <td>${st.attended} / ${st.total}</td>
+      <td>${pct}</td>
+      <td>${badge(statusOn(s.id, date))}</td>
+      <td>
+        <button class="btn small" data-act="history" data-id="${esc(s.id)}">History</button>
+        <button class="btn small" data-act="edit" data-id="${esc(s.id)}">Edit</button>
+        <button class="btn small danger" data-act="delete" data-id="${esc(s.id)}">Delete</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function renderAttendance() {
+  const date = $("date").value;
+  const list = filteredStudents();
+  if (!list.length) {
+    $("attendanceRows").innerHTML = `<tr><td colspan="4" class="empty">No students found.</td></tr>`;
+    return;
+  }
+  $("attendanceRows").innerHTML = list.map(s => {
+    const cur = statusOn(s.id, date);
+    let cell;
+    if (cur && !unlocked.has(s.id)) {
+      cell = `${badge(cur)} <button class="btn small" data-act="change" data-id="${esc(s.id)}">Change</button>`;
+    } else {
+      cell = STATUSES.map(st =>
+        `<button class="btn small status-btn ${cur === st ? "sel-" + st : ""}" data-act="mark" data-id="${esc(s.id)}" data-status="${st}">${st}</button>`
+      ).join("");
+    }
+    return `<tr>
+      <td>${esc(s.id)}</td>
+      <td>${esc(s.name)}</td>
+      <td>${esc(s.dept)}</td>
+      <td>${cell}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderAll() {
+  renderDeptOptions();
+  renderSummary();
+  renderStudents();
+  renderAttendance();
+}
+
+/* ---------- Attendance actions ---------- */
+function markAttendance(sid, status) {
+  const date = $("date").value;
+  if (!date) return toast("Please select a date.");
+  const existing = records.find(r => r.sid === sid && r.date === date);
+  if (existing && !unlocked.has(sid)) return toast("Attendance already marked for this student on this date.");
+  if (existing) existing.status = status; else records.push({ sid, date, status });
+  unlocked.delete(sid);
+  saveAll(); renderAll(); toast("Attendance saved.");
+}
+
+function markAllPresent() {
+  const date = $("date").value; let count = 0;
+  if (!date) return toast("Please select a date.");
+  filteredStudents().forEach(s => {
+    if (!statusOn(s.id, date)) { records.push({ sid: s.id, date, status: "Present" }); count++; }
+  });
+  saveAll(); renderAll(); toast(count + " student(s) marked present.");
+}
+
+/* ---------- Student CRUD ---------- */
+function openStudentModal(id) {
+  editingId = id || null;
+  $("formError").textContent = "";
+  $("modalTitle").textContent = id ? "Edit Student" : "Add Student";
+  const s = id ? students.find(x => x.id === id) : null;
+  $("sId").value = s ? s.id : "";
+  $("sName").value = s ? s.name : "";
+  $("sDept").value = s ? s.dept : "";
+  $("sId").disabled = !!id;
+  $("studentModal").classList.remove("hidden");
+}
+
+function saveStudent() {
+  const id = $("sId").value.trim(), name = $("sName").value.trim(), dept = $("sDept").value.trim();
+  if (!id || !name || !dept) return $("formError").textContent = "All fields are required.";
+  if (!editingId && students.some(s => s.id.toLowerCase() === id.toLowerCase()))
+    return $("formError").textContent = "Student ID already exists.";
+  if (editingId) Object.assign(students.find(s => s.id === editingId), { name, dept });
+  else students.push({ id, name, dept });
+  saveAll(); $("studentModal").classList.add("hidden"); renderAll();
+  toast(editingId ? "Student updated." : "Student added.");
+}
+
+function deleteStudent(id) {
+  if (!confirm("Delete this student and all attendance records?")) return;
+  students = students.filter(s => s.id !== id);
+  records = records.filter(r => r.sid !== id);
+  saveAll(); renderAll(); toast("Student deleted.");
+}
+
+function showHistory(id) {
+  const s = students.find(x => x.id === id), st = stats(id);
+  const rows = records.filter(r => r.sid === id).sort((a, b) => b.date.localeCompare(a.date));
+  $("historyTitle").textContent = `${s.name} (${s.id}) - Attendance History`;
+  $("historyBody").innerHTML = `<p><b>Attendance:</b> ${st.pct === null ? "-" : st.pct.toFixed(1) + "%"} (${st.attended}/${st.total})</p>` +
+    (rows.length
+      ? `<table><tr><th>Date</th><th>Status</th></tr>${rows.map(r => `<tr><td>${r.date}</td><td>${badge(r.status)}</td></tr>`).join("")}</table>`
+      : `<p class="empty">No attendance recorded yet.</p>`);
+  $("historyModal").classList.remove("hidden");
+}
+
+/* ---------- Event listeners ---------- */
+document.querySelectorAll(".tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach(p => p.classList.add("hidden"));
+    btn.classList.add("active");
+    $(btn.dataset.tab).classList.remove("hidden");
+  });
+});
+
+$("addBtn").addEventListener("click", () => openStudentModal(null));
+$("saveBtn").addEventListener("click", saveStudent);
+$("cancelBtn").addEventListener("click", () => $("studentModal").classList.add("hidden"));
+$("closeHistory").addEventListener("click", () => $("historyModal").classList.add("hidden"));
+$("markAllBtn").addEventListener("click", markAllPresent);
+
+["search", "deptFilter", "statusFilter"].forEach(id => {
+  $(id).addEventListener("input", renderAll);
+});
+
+$("date").addEventListener("input", () => { unlocked.clear(); renderAll(); });
+
+$("threshold").addEventListener("input", () => {
+  let v = Number($("threshold").value);
+  if (!v) return;
+  threshold = Math.min(100, Math.max(1, v));
+  saveAll(); renderAll();
+});
+
+$("studentRows").addEventListener("click", e => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  if (btn.dataset.act === "history") showHistory(id);
+  else if (btn.dataset.act === "edit") openStudentModal(id);
+  else if (btn.dataset.act === "delete") deleteStudent(id);
+});
+
+$("attendanceRows").addEventListener("click", e => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  if (btn.dataset.act === "change") { unlocked.add(id); renderAttendance(); }
+  else if (btn.dataset.act === "mark") markAttendance(id, btn.dataset.status);
+});
+
+/* ---------- Init ---------- */
+$("date").value = todayStr();
+$("threshold").value = threshold;
+renderAll();
